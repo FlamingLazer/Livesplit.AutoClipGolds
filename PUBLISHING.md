@@ -3,7 +3,7 @@
 1. Create a repository named `Auto-Clip-Golds` in your GitHub account.
 2. Upload this folder's contents to the repository root. `README.md`, `src`, `scripts`, `tests`, and `dist` should sit directly in the root, rather than inside another folder.
 3. Commit the upload. GitHub will display `README.md` on the repository page.
-4. Create a release tagged `v0.9.0`, titled **Auto Clip Golds v0.9.0 (Preview)**.
+4. Create a release tagged `v0.9.1`, titled **Auto Clip Golds v0.9.1 (Preview)**.
 5. Attach `LiveSplit.GoldClip.dll` from `dist` as a release asset, or attach the separately prepared release ZIP.
 6. Preview the README and follow its setup instructions on a clean installation before announcing the release.
 

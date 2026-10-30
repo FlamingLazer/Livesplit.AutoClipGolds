@@ -98,6 +98,7 @@ class Tests
         state2.AdjustedStartTime = TimeStamp.Now - TimeSpan.FromSeconds(80);
         model2.Split();
         var complete = clips2[0];
+        Assert(Math.Abs(complete.SegmentTime.Value.TotalSeconds - 80) < 0.2, "Filename time includes sixty second offset while footage lasts twenty seconds");
         for (int n = 0; n < 150 && complete.File == null; n++) await Task.Delay(100);
         Assert(complete.File != null && System.IO.File.Exists(complete.File), "Full capture and FFmpeg trim creates clip");
         using (var probe = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
@@ -172,7 +173,7 @@ class Tests
         var clips5 = (System.Collections.Generic.Dictionary<int, Clip>)clipsField.GetValue(component5);
         var offsetClip = clips5[0];
         Assert(Math.Abs(offsetClip.Start - originalStart) < 0.001, "Tag offset preserves actual footage start");
-        Assert(Math.Abs(offsetClip.SegmentTime.Value.TotalSeconds - 300) < 0.2, "Synthetic offset removed from filename duration only");
+        Assert(Math.Abs(offsetClip.SegmentTime.Value.TotalSeconds - 360) < 0.2, "Filename retains LiveSplit segment time including offset");
         model5.UndoSplit(); Assert(offsetClip.Undone, "Offset clip still supports undo");
         component5.Dispose();
         foreach (double tag in new[] { 0.0, 29.83 })
@@ -193,7 +194,7 @@ class Tests
                 state6.AdjustedStartTime = TimeStamp.Now - TimeSpan.FromSeconds(159.8 + tag);
                 model6.Split();
                 var clips6 = (System.Collections.Generic.Dictionary<int, Clip>)clipsField.GetValue(component6);
-                Assert(Math.Abs(clips6[0].SegmentTime.Value.TotalSeconds - 20) < 0.2, "Twenty second quick test subtracts combined synthetic offsets " + tag);
+                Assert(Math.Abs(clips6[0].SegmentTime.Value.TotalSeconds - (159.8 + tag)) < 0.2, "Filename preserves starting timer and split tag offsets " + tag);
                 Assert(Math.Abs(clips6[0].Start - firstStart) < 0.001, "Combined offsets preserve all twenty seconds of footage " + tag);
                 state6.AdjustedStartTime = TimeStamp.Now - TimeSpan.FromSeconds(179.8 + tag);
                 model6.Split();

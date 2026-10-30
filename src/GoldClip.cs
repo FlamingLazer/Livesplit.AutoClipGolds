@@ -29,7 +29,7 @@ namespace GoldClip
         public string UpdateName { get { return ComponentName; } }
         public string XMLURL { get { return ""; } }
         public string UpdateURL { get { return ""; } }
-        public Version Version { get { return new Version(0, 9, 0); } }
+        public Version Version { get { return new Version(0, 9, 1); } }
         public IComponent Create(LiveSplitState state) { return new Component(state); }
     }
 
@@ -191,7 +191,6 @@ namespace GoldClip
         volatile string status = "Ready (OBS must have replay buffer running)";
         volatile bool disposed;
         double? runStart;
-        TimeSpan initialRunOffset;
         public Component(LiveSplitState state)
         {
             this.state = state;
@@ -200,7 +199,6 @@ namespace GoldClip
         double Now { get { return clock.Elapsed.TotalSeconds; } }
         void Started(object sender, EventArgs e) {
             starts.Clear(); clips.Clear(); starts[0] = Now; runStart = starts[0];
-            initialRunOffset = state.Run.Offset > TimeSpan.Zero ? state.Run.Offset : TimeSpan.Zero;
         }
         void Skip(object sender, EventArgs e) { starts[state.CurrentSplitIndex] = Now; }
         void Split(object sender, EventArgs e)
@@ -222,18 +220,8 @@ namespace GoldClip
             if (!LiveSplitStateHelper.CheckBestSegment(state, i, state.CurrentTimingMethod)) return;
             var clip = new Clip { Index = i, Start = start, End = end, Name = state.Run[i].Name, Options = options.Copy(),
                 SplitDate = DateTime.Now, SegmentTime = LiveSplitStateHelper.GetPreviousSegmentTime(state, i, state.CurrentTimingMethod) };
-            // A positive starting timer value inflates the first segment time but
-            // adds no elapsed footage. Remove it from the label, not wall time.
-            if (i == 0 && clip.SegmentTime.HasValue) clip.SegmentTime -= initialRunOffset;
-            double offset = SplitOffset(clip.Name);
-            // Offset tags add synthetic timer time, not recorded footage.
-            // Keep the wall-clock segment intact even when the tag exceeds it.
-            if (offset > 0 && clip.SegmentTime.HasValue) clip.SegmentTime -= TimeSpan.FromSeconds(offset);
-            if (clip.SegmentTime.HasValue && clip.SegmentTime.Value <= TimeSpan.Zero)
-            {
-                clip.SegmentTime = TimeSpan.FromSeconds(end - start);
-                SetStatus("Offset-adjusted timer was not positive; using elapsed segment time for filename: " + clip.Name);
-            }
+            // Keep LiveSplit's segment time intact for filenames, including
+            // starting timer values and split offsets. Footage uses wall time.
             Queue(clip);
         }
         void Queue(Clip clip)

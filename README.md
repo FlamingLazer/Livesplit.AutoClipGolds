@@ -122,11 +122,11 @@ Two decimal [0:11.22] places
 [131.34] Total seconds
 ```
 
-The first valid tag is subtracted from the filename's timer duration. A positive **Start Timer at** value is also subtracted on the first split. Valid offset tags are removed from gold filenames; other bracketed text is retained.
+Gold filenames use LiveSplit's unadjusted segment time for the selected timing method, **including offsets**. A positive **Start Timer at** value stays included in the first segment's filename time. Offset tags are removed from the split-name portion of the filename, but are not subtracted from its time.
 
-Offsets add timer time, not footage. **Twenty seconds of actual play with a `[60]` tag still produces about twenty seconds of video plus padding.** If the adjusted timer value is not positive, the filename falls back to elapsed wall time and the log records a warning.
+For example, twenty seconds of actual play with sixty seconds added to the timer can produce a clip named `Maul Gold 4-15-26 1꞉20.00.mkv`, while the video still contains about twenty seconds of footage plus padding.
 
-Malformed tags are ignored. Fractions support up to three decimal places; colon-separated seconds and subordinate minutes must be below 60. Full-run filenames retain the final displayed time, including offsets; the footage always covers the actual run.
+Recognized tags are stripped anywhere in the name. Malformed tags and other bracketed text are retained. Fractions support up to three decimal places; colon-separated seconds and subordinate minutes must be below 60. Full-run filenames likewise retain the final displayed time, including offsets; the footage covers the actual run.
 
 ## Padding and performance
 
