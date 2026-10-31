@@ -179,6 +179,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -LiveSpli
 
 They use a local simulated OBS server on port 4456, synthetic videos, real FFmpeg trimming, and LiveSplit timer events. They also exercise recycling of generated test clips. Temporary files stay under `work`.
 
+## Layout-refresh fix (v0.9.6 prerelease)
+
+Previous builds serialized settings and re-encrypted a configured OBS password whenever LiveSplit checked whether the layout changed. Fresh encryption produced different XML for identical settings. That could repeatedly invalidate the layout, causing unnecessary redraw work on the UI thread shared with the autosplitter, even in a passive build with no clipping.
+
+This version implements LiveSplit's fast `GetSettingsHashCode` hook. It checks the actual setting values without serializing XML or invoking Windows password protection. Actual settings saves reuse the cached encrypted password until the password changes. Existing saved passwords still load normally.
+
+The issue was reproduced with LiveSplit's real layout saver: 50 unchanged checks produced 50 distinct hashes before the fix and one stable hash afterward. Tests also cover real setting changes and encrypted password round trips. The affected TCS room-split setup was also retested successfully by a user. Broader compatibility and performance testing are still welcome.
+
+## Deferred split handling
+
+After LiveSplit records a split, the component snapshots its timing and metadata and returns. Gold detection runs on an on-demand background dispatcher. Start, skip, split, and undo events are processed in order, using their original timestamps. It does not poll while a segment is running, and the dispatcher exits when its queue is empty.
+
+OBS saving and trimming begin only after a qualifying gold, or after a completed run in Full runs mode. There is no per-split diagnostic logging in this build. Filenames retain LiveSplit's segment times including offsets; footage uses actual elapsed time.
+
+Tests cover blocked-worker callback responsiveness, immutable snapshots, queued undo/re-splits, and a 1,000-split non-gold sequence, alongside existing capture/trim tests.
+
 ## Update or uninstall
 
 To update, close LiveSplit and replace `Components\LiveSplit.GoldClip.dll`. Existing component settings remain in your saved layout.

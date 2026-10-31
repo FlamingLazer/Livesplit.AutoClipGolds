@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
@@ -29,7 +30,7 @@ namespace GoldClip
         public string UpdateName { get { return ComponentName; } }
         public string XMLURL { get { return ""; } }
         public string UpdateURL { get { return ""; } }
-        public Version Version { get { return new Version(0, 9, 1); } }
+        public Version Version { get { return new Version(0, 9, 6); } }
         public IComponent Create(LiveSplitState state) { return new Component(state); }
     }
 
@@ -173,7 +174,8 @@ namespace GoldClip
         public double Start, End;
         public string Name, Id = Guid.NewGuid().ToString("N"), File;
         public Options Options;
-        public bool Undone;
+        int cancelled;
+        public bool Undone { get { return Volatile.Read(ref cancelled) != 0; } set { if (value) Interlocked.Exchange(ref cancelled, 1); } }
         public bool IsFullRun;
         public DateTime SplitDate;
         public TimeSpan? SegmentTime;
@@ -188,61 +190,150 @@ namespace GoldClip
         readonly Dictionary<int, Clip> clips = new Dictionary<int, Clip>();
         readonly SemaphoreSlim saveGate = new SemaphoreSlim(1, 1);
         Options options = new Options();
-        volatile string status = "Ready (OBS must have replay buffer running)";
+        volatile string status = "Auto Clip Golds 0.9.6 test - ready";
         volatile bool disposed;
         double? runStart;
+        Time[] matchingSplitTimes = new Time[0], matchingComparisons = new Time[0];
+        int activeCaptures;
+        readonly ConcurrentQueue<Action> pendingEvents = new ConcurrentQueue<Action>();
+        int dispatching;
+        readonly IDictionary<string, Action> menu;
+        string protectedPasswordSource, protectedPasswordValue;
+        bool hasProtectedPassword;
         public Component(LiveSplitState state)
         {
             this.state = state;
+            menu = new Dictionary<string, Action> { { "Auto Clip Golds status", () => MessageBox.Show(status, "Auto Clip Golds") } };
             state.OnStart += Started; state.OnSplit += Split; state.OnUndoSplit += Undo; state.OnSkipSplit += Skip;
         }
         double Now { get { return clock.Elapsed.TotalSeconds; } }
-        void Started(object sender, EventArgs e) {
-            starts.Clear(); clips.Clear(); starts[0] = Now; runStart = starts[0];
+        // Event callbacks only snapshot already-recorded values and enqueue work.
+        // One on-demand dispatcher preserves start/split/undo order. It exits
+        // when idle; there is no polling loop or periodic timer for capture.
+        void Post(Action action)
+        {
+            if (disposed) return;
+            pendingEvents.Enqueue(action);
+            StartDispatcher();
         }
-        void Skip(object sender, EventArgs e) { starts[state.CurrentSplitIndex] = Now; }
+        void StartDispatcher()
+        {
+            if (Interlocked.CompareExchange(ref dispatching, 1, 0) != 0) return;
+            Task.Run(() => {
+                try {
+                    Action action;
+                    while (pendingEvents.TryDequeue(out action)) {
+                        if (disposed) continue;
+                        try { action(); } catch (Exception ex) { SetStatus("Split processing error: " + ex.Message); }
+                    }
+                }
+                finally { Volatile.Write(ref dispatching, 0); if (!pendingEvents.IsEmpty) StartDispatcher(); }
+            });
+        }
+        void Started(object sender, EventArgs e)
+        {
+            double when = Now; int count = state.Run.Count;
+            Post(() => {
+                starts.Clear(); clips.Clear(); starts[0] = when; runStart = when;
+                matchingSplitTimes = new Time[count + 1]; matchingComparisons = new Time[count + 1];
+            });
+        }
+        void Skip(object sender, EventArgs e)
+        {
+            double when = Now; int index = state.CurrentSplitIndex;
+            Post(() => {
+                starts[index] = when; int i = index - 1;
+                if (i >= 0 && i + 1 < matchingSplitTimes.Length) RecordComparison(i, default(Time), default(Time));
+            });
+        }
+        sealed class SplitSnapshot
+        {
+            public int Index, RunCount;
+            public double End;
+            public bool Ended;
+            public Time SplitTime, Comparison, Best, Previous;
+            public TimingMethod Method;
+            public string Name, Category;
+            public DateTime Date;
+            public Options Options;
+        }
+        void RecordComparison(int index, Time split, Time comparison)
+        {
+            var priorSplit = matchingSplitTimes[index]; var priorComparison = matchingComparisons[index];
+            if (split.RealTime.HasValue && comparison.RealTime.HasValue) { priorSplit.RealTime = split.RealTime; priorComparison.RealTime = comparison.RealTime; }
+            if (split.GameTime.HasValue && comparison.GameTime.HasValue) { priorSplit.GameTime = split.GameTime; priorComparison.GameTime = comparison.GameTime; }
+            matchingSplitTimes[index + 1] = priorSplit; matchingComparisons[index + 1] = priorComparison;
+        }
+        public static bool IsGold(TimeSpan? current, TimeSpan? previous, TimeSpan? best,
+            TimeSpan? comparison, TimeSpan? matchingSplit, TimeSpan? matchingComparison)
+        {
+            if (!current.HasValue) return false;
+            TimeSpan? segment = current - previous;
+            TimeSpan? delta = current - comparison;
+            if (matchingSplit.HasValue) delta -= matchingSplit - matchingComparison;
+            return !best.HasValue || segment < best || delta < TimeSpan.Zero;
+        }
         void Split(object sender, EventArgs e)
         {
-            int i = state.CurrentSplitIndex - 1; double end = Now;
-            starts[state.CurrentSplitIndex] = end;
-            if (state.CurrentPhase == TimerPhase.Ended && options.CaptureMode == 1 && runStart.HasValue)
+            int index = state.CurrentSplitIndex - 1;
+            if (index < 0 || index >= state.Run.Count) return;
+            var segment = state.Run[index];
+            var snapshot = new SplitSnapshot {
+                Index = index, RunCount = state.Run.Count, End = Now,
+                Ended = state.CurrentPhase == TimerPhase.Ended,
+                SplitTime = segment.SplitTime, Comparison = segment.Comparisons["Best Segments"],
+                Best = segment.BestSegmentTime, Previous = index == 0 ? new Time(TimeSpan.Zero, TimeSpan.Zero) : state.Run[index - 1].SplitTime,
+                Method = state.CurrentTimingMethod, Name = segment.Name,
+                Category = state.Run.CategoryName, Date = DateTime.Now, Options = options.Copy()
+            };
+            Post(() => HandleSplit(snapshot));
+        }
+        void HandleSplit(SplitSnapshot snapshot)
+        {
+            int i = snapshot.Index; double end = snapshot.End;
+            starts[i + 1] = end;
+            if (i + 1 >= matchingSplitTimes.Length) { SetStatus("Start a fresh attempt to capture clips."); return; }
+            RecordComparison(i, snapshot.SplitTime, snapshot.Comparison);
+            if (snapshot.Ended && snapshot.Options.CaptureMode == 1 && runStart.HasValue)
             {
                 Queue(new Clip { Index = -1, IsFullRun = true, Start = runStart.Value, End = end,
-                    Name = string.IsNullOrWhiteSpace(state.Run.CategoryName) ? "Uncategorized" : state.Run.CategoryName,
-                    Options = options.Copy(), SplitDate = DateTime.Now,
-                    SegmentTime = state.CurrentTime[state.CurrentTimingMethod] ?? state.CurrentTime.RealTime });
+                    Name = string.IsNullOrWhiteSpace(snapshot.Category) ? "Uncategorized" : snapshot.Category,
+                    Options = snapshot.Options, SplitDate = snapshot.Date,
+                    SegmentTime = snapshot.SplitTime[snapshot.Method] ?? snapshot.SplitTime.RealTime });
             }
-            if (options.CaptureMode == 1) return;
+            if (snapshot.Options.CaptureMode == 1) return;
             double start;
-            if (i < 0 || !starts.TryGetValue(i, out start)) { SetStatus("Start a fresh attempt to capture clips."); return; }
-            // A skipped split combines multiple levels, so it is not a single-level gold.
-            if (i > 0 && state.Run[i - 1].SplitTime[state.CurrentTimingMethod] == null) return;
-            if (!LiveSplitStateHelper.CheckBestSegment(state, i, state.CurrentTimingMethod)) return;
-            var clip = new Clip { Index = i, Start = start, End = end, Name = state.Run[i].Name, Options = options.Copy(),
-                SplitDate = DateTime.Now, SegmentTime = LiveSplitStateHelper.GetPreviousSegmentTime(state, i, state.CurrentTimingMethod) };
-            // Keep LiveSplit's segment time intact for filenames, including
-            // starting timer values and split offsets. Footage uses wall time.
-            Queue(clip);
+            if (!starts.TryGetValue(i, out start)) { SetStatus("Start a fresh attempt to capture clips."); return; }
+            TimingMethod method = snapshot.Method;
+            TimeSpan? previousTime = snapshot.Previous[method];
+            if (i > 0 && !previousTime.HasValue) return;
+            if (!IsGold(snapshot.SplitTime[method], previousTime, snapshot.Best[method],
+                snapshot.Comparison[method], matchingSplitTimes[i][method], matchingComparisons[i][method])) return;
+            Queue(new Clip { Index = i, Start = start, End = end, Name = snapshot.Name, Options = snapshot.Options,
+                SplitDate = snapshot.Date, SegmentTime = snapshot.SplitTime[method] - previousTime });
         }
         void Queue(Clip clip)
         {
             clips[clip.Index] = clip;
+            Interlocked.Increment(ref activeCaptures);
             Task.Run(() => Capture(clip));
         }
         void Undo(object sender, EventArgs e)
         {
-            int i = state.CurrentSplitIndex;
-            CancelClip(i);
-            // Undoing the final split also invalidates that finished run's clip.
-            if (i == state.Run.Count - 1) CancelClip(-1);
-            foreach (int key in new List<int>(starts.Keys)) if (key > i) starts.Remove(key);
+            int index = state.CurrentSplitIndex, count = state.Run.Count;
+            Post(() => {
+                CancelClip(index);
+                if (index == count - 1) CancelClip(-1);
+                foreach (int key in new List<int>(starts.Keys)) if (key > index) starts.Remove(key);
+            });
         }
         void CancelClip(int i)
         {
             Clip clip;
             if (clips.TryGetValue(i, out clip))
             {
-                lock (clip.Gate) { clip.Undone = true; }
+                // The timer thread must never wait for recycling or file I/O.
+                clip.Undone = true;
                 Task.Run(() => { try { lock (clip.Gate) { Recycle(clip.File); } SetStatus("Undone clip removed."); } catch (Exception ex) { SetStatus("Could not recycle clip: " + ex.Message); } });
                 clips.Remove(i);
             }
@@ -254,9 +345,26 @@ namespace GoldClip
         void SetStatus(string message)
         {
             status = message;
-            try { lock (logGate) { Directory.CreateDirectory(options.Folder); File.AppendAllText(Path.Combine(options.Folder, "GoldClip.log"), DateTime.Now.ToString("s") + " " + message + Environment.NewLine); } } catch { }
+            WriteLog(message);
         }
-        static readonly object logGate = new object();
+        void WriteLog(string message)
+        {
+            string folder = options.Folder;
+            string entry = DateTime.Now.ToString("s") + " " + message + Environment.NewLine;
+            if (Interlocked.Increment(ref logCount) > 256) { Interlocked.Decrement(ref logCount); return; }
+            logs.Enqueue(() => { try { Directory.CreateDirectory(folder); File.AppendAllText(Path.Combine(folder, "GoldClip.log"), entry); } catch { } });
+            StartLogger();
+        }
+        static readonly ConcurrentQueue<Action> logs = new ConcurrentQueue<Action>();
+        static int logCount, logging;
+        static void StartLogger()
+        {
+            if (Interlocked.CompareExchange(ref logging, 1, 0) != 0) return;
+            Task.Run(() => {
+                try { Action write; while (logs.TryDequeue(out write)) { Interlocked.Decrement(ref logCount); write(); } }
+                finally { Volatile.Write(ref logging, 0); if (!logs.IsEmpty) StartLogger(); }
+            });
+        }
         static string Quote(string value) { if (value.Contains("\"")) throw new ArgumentException("Invalid quote in path."); return "\"" + value + "\""; }
         static string Number(double value) { return value.ToString("0.000", CultureInfo.InvariantCulture); }
         public static double SeekStart(double duration, double saveTime, double segmentStart, int before)
@@ -418,7 +526,10 @@ namespace GoldClip
                 try { lock (clip.Gate) { if (clip.Undone) { Recycle(raw); Recycle(output); } else { clip.File = raw; if (output != null && File.Exists(output)) Recycle(output); } } } catch { }
                 SetStatus("Clip error: " + ex.Message + (raw != null ? " Replay: " + raw : ""));
             }
-            finally { if (held) saveGate.Release(); if (output != null) lock (reservedNames) { reservedNames.Remove(output); } }
+            finally {
+                Interlocked.Decrement(ref activeCaptures);
+                if (held) saveGate.Release(); if (output != null) lock (reservedNames) { reservedNames.Remove(output); }
+            }
         }
 
         public Control GetSettingsControl(LayoutMode mode)
@@ -549,17 +660,43 @@ namespace GoldClip
             int row = table.RowCount++; table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             table.Controls.Add(control, 0, row); table.SetColumnSpan(control, 3);
         }
+        // LiveSplit calls this optional method while checking the layout on
+        // redraw ticks. Never serialize XML or encrypt a password here.
+        public int GetSettingsHashCode()
+        {
+            unchecked
+            {
+                int hash = 17;
+                hash = hash * 31 + (options.Url ?? "").GetHashCode();
+                hash = hash * 31 + (options.Password ?? "").GetHashCode();
+                hash = hash * 31 + (options.Folder ?? "").GetHashCode();
+                hash = hash * 31 + (options.FFmpeg ?? "").GetHashCode();
+                hash = hash * 31 + options.CaptureMode;
+                hash = hash * 31 + options.Before;
+                hash = hash * 31 + options.After;
+                return hash;
+            }
+        }
+        string ProtectedPassword()
+        {
+            string password = options.Password ?? "";
+            if (hasProtectedPassword && protectedPasswordSource == password) return protectedPasswordValue;
+            string value = "";
+            if (password.Length > 0)
+            {
+                try { value = Convert.ToBase64String(ProtectedData.Protect(Encoding.UTF8.GetBytes(password), null, DataProtectionScope.CurrentUser)); }
+                catch (CryptographicException) { SetStatus("Windows could not protect the OBS password. Re-enter it after restarting LiveSplit."); }
+            }
+            protectedPasswordSource = password; protectedPasswordValue = value; hasProtectedPassword = true;
+            return value;
+        }
         public XmlNode GetSettings(XmlDocument doc)
         {
             var root = doc.CreateElement("Settings");
             foreach (var field in typeof(Options).GetFields())
             {
                 var item = doc.CreateElement(field.Name); string value = Convert.ToString(field.GetValue(options), CultureInfo.InvariantCulture);
-                if (field.Name == "Password" && value.Length > 0)
-                {
-                    try { value = Convert.ToBase64String(ProtectedData.Protect(Encoding.UTF8.GetBytes(value), null, DataProtectionScope.CurrentUser)); }
-                    catch (CryptographicException) { value = ""; SetStatus("Windows could not protect the OBS password. Re-enter it after restarting LiveSplit."); }
-                }
+                if (field.Name == "Password") value = ProtectedPassword();
                 item.InnerText = value; root.AppendChild(item);
             }
             return root;
@@ -573,6 +710,7 @@ namespace GoldClip
                 {
                     string value = node.InnerText;
                     if (field.Name == "Password" && value.Length > 0) value = Encoding.UTF8.GetString(ProtectedData.Unprotect(Convert.FromBase64String(value), null, DataProtectionScope.CurrentUser));
+                    if (field.Name == "Password") { protectedPasswordSource = value; protectedPasswordValue = node.InnerText; hasProtectedPassword = true; }
                     if (field.FieldType == typeof(int)) field.SetValue(options, Math.Max(0, Math.Min(field.Name == "CaptureMode" ? 1 : 30, int.Parse(value, CultureInfo.InvariantCulture))));
                     else field.SetValue(options, value);
                 }
@@ -589,7 +727,7 @@ namespace GoldClip
         public float PaddingBottom { get { return 0; } }
         public float PaddingLeft { get { return 0; } }
         public float PaddingRight { get { return 0; } }
-        public IDictionary<string, Action> ContextMenuControls { get { return new Dictionary<string, Action> { { "Auto Clip Golds status", () => MessageBox.Show(status, "Auto Clip Golds") } }; } }
+        public IDictionary<string, Action> ContextMenuControls { get { return menu; } }
         public void DrawHorizontal(Graphics g, LiveSplitState s, float height, Region region) { }
         public void DrawVertical(Graphics g, LiveSplitState s, float width, Region region) { }
         public void Update(IInvalidator invalidator, LiveSplitState s, float width, float height, LayoutMode mode) { }
